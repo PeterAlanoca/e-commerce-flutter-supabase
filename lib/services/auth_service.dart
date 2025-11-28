@@ -2,7 +2,7 @@ import 'package:supabase_flutter/supabase_flutter.dart' as supabase;
 import 'package:drift/drift.dart';
 import '../database/database.dart';
 import 'database_service.dart';
-
+import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 class AuthService {
   final DatabaseService _db = DatabaseService.instance;
   final supabase.SupabaseClient _supabase = supabase.Supabase.instance.client;
@@ -148,6 +148,63 @@ class AuthService {
 
   Future<void> logout() async {
     await _supabase.auth.signOut();
+  }
+
+  // Store Supabase session tokens securely
+  Future<void> storeSessionTokens(supabase.Session session) async {
+    final storage = const FlutterSecureStorage();
+    await storage.write(key: 'supabase_access_token', value: session.accessToken);
+    await storage.write(key: 'supabase_refresh_token', value: session.refreshToken);
+  }
+
+  // ---------- MFA SUPPORT ----------
+  /// Enroll the user in TOTP MFA. Returns the QR code data that can be shown in UI.
+  Future<String?> enrollMFA() async {
+    try {
+      final response = await _supabase.auth.mfa.enroll(
+        factorType: supabase.FactorType.totp,
+      );
+      // The response contains a QR code URL (data:image/png;base64,...) that can be displayed.
+      return response.totp?.qrCode;
+    } catch (e) {
+      print('Error enrolling MFA: $e');
+      return null;
+    }
+  }
+
+  /// Perform login with password, then if MFA is required, challenge and verify the TOTP code.
+  /// Returns the authenticated user or null if verification fails.
+  Future<User?> loginWithMFA(String email, String password, String totpCode) async {
+    try {
+      // First step: password authentication
+      final response = await _supabase.auth.signInWithPassword(
+        email: email,
+        password: password,
+      );
+
+      // If the user does not exist or password is wrong
+      if (response.user == null) return null;
+
+      // Check if MFA is required for this session
+      if (response.session?.mfaRequired == true) {
+        // Challenge the factor (the factorId is obtained from the session)
+        final challenge = await _supabase.auth.mfa.challenge(
+          factorId: response.session!.factorId!,
+        );
+        // Verify the TOTP code supplied by the user
+        await _supabase.auth.mfa.verify(
+          factorId: response.session!.factorId!,
+          challengeId: challenge.id,
+          code: totpCode,
+        );
+      }
+
+      // After successful MFA (or if not required), sync locally and return user
+      return await _syncUserLocally(response.user!);
+    } catch (e) {
+      print('Error during MFA login: $e');
+      rethrow;
+    }
   }
 
   Future<bool> hasPermission(User user, String permission) async {
